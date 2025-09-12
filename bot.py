@@ -152,4 +152,132 @@ def signal_m5(df_m5, symbol):
     if has_volume:
         vol_ok = (rv >= th["rvol_min"]).fillna(False)
     else:
-        rv = pd.Series([1.0] * len(df_m5), index=df_m5
+        rv = pd.Series([1.0] * len(df_m5), index=df_m5.index)
+        vol_ok = pd.Series([True] * len(df_m5), index=df_m5.index)
+
+    bull_c = (bullish_engulfing(df_m5) | pin_bar(df_m5, bullish=True)).fillna(False)
+    bear_c = (bearish_engulfing(df_m5) | pin_bar(df_m5, bullish=False)).fillna(False)
+
+    bull_osc = (r < 55) & (K.shift(1) < D.shift(1)) & (K > D) & (r.diff() > 0)
+    bear_osc = (r > 45) & (K.shift(1) > D.shift(1)) & (K < D) & (r.diff() < 0)
+
+    atr_ok = (atr_pct > th["atr_min_frac"]).fillna(False)
+
+    close = df_m5["close"]
+    over = th["bb_overext"] * a
+    buy_bb = (close > ma) & (close <= (bb_u + over))
+    sell_bb = (close < ma) & (close >= (bb_l - over))
+
+    recent_buy_zone = (
+        (close <= ma) | (close <= ma + (bb_u - ma) * 0.25) | (close <= ma + a * 0.2)
+    ).rolling(SIGNAL_EXPIRATION_BARS).apply(lambda x: (x > 0).any(), raw=True).astype(bool)
+
+    recent_sell_zone = (
+        (close >= ma) | (close >= ma - (ma - bb_l) * 0.25) | (close >= ma - a * 0.2)
+    ).rolling(SIGNAL_EXPIRATION_BARS).apply(lambda x: (x > 0).any(), raw=True).astype(bool)
+
+    bull_trigger = (bull_osc & bull_c).fillna(False)
+    bear_trigger = (bear_osc & bear_c).fillna(False)
+    fresh_bull = bool(bull_trigger.tail(SIGNAL_EXPIRATION_BARS).any())
+    fresh_bear = bool(bear_trigger.tail(SIGNAL_EXPIRATION_BARS).any())
+
+    i = -1
+    long_ok = bool(atr_ok.iloc[i] and vol_ok.iloc[i] and buy_bb.iloc[i] and recent_buy_zone.iloc[i] and fresh_bull)
+    short_ok = bool(atr_ok.iloc[i] and vol_ok.iloc[i] and sell_bb.iloc[i] and recent_sell_zone.iloc[i] and fresh_bear)
+
+    meta = {
+        "atr_pct": float(atr_pct.iloc[i]) if len(atr_pct) else None,
+        "rsi": float(r.iloc[i]) if len(r) else None,
+        "stoch_k": float(K.iloc[i]) if len(K) else None,
+        "stoch_d": float(D.iloc[i]) if len(D) else None,
+        "rvol": float(rv.iloc[i]) if len(rv) else None,
+        "bull_candle": bool(bull_c.iloc[i]) if len(bull_c) else False,
+        "bear_candle": bool(bear_c.iloc[i]) if len(bear_c) else False,
+        "bb_middle": float(ma.iloc[i]) if len(ma) else None,
+        "bb_upper": float(bb_u.iloc[i]) if len(bb_u) else None,
+        "bb_lower": float(bb_l.iloc[i]) if len(bb_l) else None,
+        "fresh_window_bars": int(SIGNAL_EXPIRATION_BARS),
+        "has_volume": bool(has_volume),
+    }
+    return long_ok, short_ok, meta
+
+# ========== Telegram ==========
+def send_message(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Telegram not configured"); print(text); return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True}
+    try:
+        requests.post(url, json=payload, timeout=15)
+    except Exception as e:
+        print(f"[Telegram] {e}")
+
+def assemble_message(symbol, direction, meta, df_h1, df_m15, df_m5):
+    m5 = df_m5.iloc[-1]; h1 = df_h1.iloc[-1]; m15 = df_m15.iloc[-1]
+    txt = []
+    txt.append(f"<b>{symbol}</b> — <b>{direction}</b> signal 🚨")
+    txt.append(f"Time: {now_utc_iso()}")
+    txt.append("")
+    txt.append("<b>Filters</b>")
+    txt.append(f"• ATR%: {meta['atr_pct']:.4f}")
+    txt.append(f"• RSI: {meta['rsi']:.1f}  |  Stoch K/D: {meta['stoch_k']:.1f}/{meta['stoch_d']:.1f}")
+    if meta["has_volume"]:
+        txt.append(f"• RVOL: {meta['rvol']:.2f}")
+    else:
+        txt.append("• RVOL: n/a (no volume in feed)")
+    txt.append(f"• Candle: {'Bullish' if meta['bull_candle'] else ('Bearish' if meta['bear_candle'] else 'None')}")
+    txt.append(f"• BB: mid {meta['bb_middle']:.3f} | up {meta['bb_upper']:.3f} | lo {meta['bb_lower']:.3f}")
+    txt.append(f"• Fresh-window: {meta['fresh_window_bars']} bars")
+    txt.append("")
+    txt.append("<b>Last M5 Bar</b>")
+    txt.append(f"O:{m5['open']:.3f} H:{m5['high']:.3f} L:{m5['low']:.3f} C:{m5['close']:.3f} Vol:{0 if pd.isna(m5['volume']) else int(m5['volume'])}")
+    txt.append("")
+    txt.append("<b>Context</b>")
+    txt.append(f"H1 Close: {h1['close']:.3f} | M15 Close: {m15['close']:.3f}")
+    txt.append("— Trend: H1 & M15 aligned with signal direction")
+    return "\n".join(txt)
+
+# ========== Main Loop ==========
+def main():
+    if not TD_API_KEY:
+        print("[ERROR] TD_API_KEY missing"); return
+    last_bar = {}
+
+    while True:
+        try:
+            for symbol in SYMBOLS:
+                try:
+                    df_m5 = fetch_series(symbol, "5min", 200)
+                    df_m15 = fetch_series(symbol, "15min", 200)
+                    df_h1 = fetch_series(symbol, "1h", 300)
+                    if df_m5 is None or df_m15 is None or df_h1 is None:
+                        print(f"[WARN] data fetch failed for {symbol}")
+                        continue
+
+                    last_dt = df_m5["datetime"].iloc[-1].isoformat()
+                    if last_bar.get(symbol) == last_dt:
+                        continue
+                    last_bar[symbol] = last_dt
+
+                    up_h1, up_m15, dn_h1, dn_m15 = trend_bias(df_h1, df_m15)
+                    long_ok, short_ok, meta = signal_m5(df_m5, symbol)
+
+                    fire_long = long_ok and up_h1 and up_m15
+                    fire_short = short_ok and dn_h1 and dn_m15
+
+                    if fire_long or fire_short:
+                        direction = "BUY" if fire_long else "SELL"
+                        msg = assemble_message(symbol, direction, meta, df_h1, df_m15, df_m5)
+                        send_message(msg)
+                        print(msg)
+                    else:
+                        print(f"[{symbol}] {last_dt} — no aligned signal.")
+                except Exception as e_sym:
+                    print(f"[ERROR] Symbol loop exception for {symbol}: {e_sym}")
+            time.sleep(POLL_SECONDS)
+        except Exception as e:
+            print(f"[ERROR] Loop exception: {e}")
+            time.sleep(POLL_SECONDS)
+
+if __name__ == "__main__":
+    main()
