@@ -9,7 +9,7 @@ load_dotenv()
 TD_API_KEY = os.getenv("TD_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS","XAU/USD,USD/JPY").split(",") if s.strip()]
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS","EUR/USD,USD/JPY").split(",") if s.strip()]
 POLL_SECONDS = int(os.getenv("POLL_SECONDS","60"))
 ATR_PERIOD = int(os.getenv("ATR_PERIOD","14"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD","14"))
@@ -27,14 +27,10 @@ THRESH = {
 def now_utc_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# ========== Data ==========
+# ========== Data (Improved Twelve Data fetch with logging + fallback) ==========
 BASE_URL = "https://api.twelvedata.com/time_series"
 
-def fetch_series(symbol: str, interval: str, outputsize: int = 300):
-    """
-    Fetches OHLCV (if available) from Twelve Data.
-    Some FX/metal feeds don't include 'volume' — we create a NaN column so downstream code won't KeyError.
-    """
+def _fetch_once(symbol: str, interval: str, outputsize: int):
     params = {
         "symbol": symbol,
         "interval": interval,
@@ -44,18 +40,52 @@ def fetch_series(symbol: str, interval: str, outputsize: int = 300):
         "order": "ASC",
     }
     r = requests.get(BASE_URL, params=params, timeout=20)
-    j = r.json()
-    if "values" not in j:
-        return None
-    df = pd.DataFrame(j["values"])
-    # Parse numeric columns that always exist
-    for c in ["open", "high", "low", "close"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        else:
-            return None
+    try:
+        j = r.json()
+    except Exception:
+        print(f"[TD] Non-JSON response ({r.status_code}) for {symbol} {interval}: {r.text[:200]}")
+        return None, None
 
-    # Handle volume optionality
+    if "values" in j:
+        return j["values"], None
+
+    # Log any error message returned by the API
+    err = j.get("message") or j.get("code") or j.get("status") or j
+    return None, err
+
+def fetch_series(symbol: str, interval: str, outputsize: int = 300):
+    """
+    Robust fetch that prints API errors and tries a fallback symbol format (e.g., USDJPY/XAUUSD)
+    when the slashed format (USD/JPY) fails.
+    """
+    # 1) First attempt with given symbol
+    values, err = _fetch_once(symbol, interval, outputsize)
+
+    # 2) Fallback: remove slash if present (USD/JPY -> USDJPY)
+    if values is None and "/" in symbol:
+        alt_symbol = symbol.replace("/", "")
+        values2, err2 = _fetch_once(alt_symbol, interval, outputsize)
+        if values2 is not None:
+            print(f"[TD] Fallback succeeded: {symbol} → {alt_symbol} on {interval}")
+            values, err = values2, None
+        else:
+            # keep the more informative error
+            err = err2 or err
+
+    if values is None:
+        print(f"[TD] Fetch failed for {symbol} {interval}: {err}")
+        return None
+
+    df = pd.DataFrame(values)
+
+    # Parse numeric OHLC (mandatory)
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns:
+            print(f"[TD] Missing column {c} for {symbol} {interval}")
+            return None
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Optional volume (many FX/CFD feeds omit it)
     if "volume" not in df.columns:
         df["volume"] = np.nan
     else:
@@ -66,7 +96,7 @@ def fetch_series(symbol: str, interval: str, outputsize: int = 300):
     return df
 
 # ========== Indicators ==========
-def ema(s, n): 
+def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
 def ema_slope(close, n, lookback):
@@ -147,6 +177,7 @@ def signal_m5(df_m5, symbol):
     K, D = stochastic(df_m5["high"], df_m5["low"], df_m5["close"], STO_K, STO_D)
     ma, bb_u, bb_l = bollinger(df_m5["close"], 20, 2.0)
 
+    # RVOL becomes optional (many FX feeds have no volume)
     rv = rvol(df_m5["volume"], 20)
     has_volume = not df_m5["volume"].isna().all() and (df_m5["volume"].fillna(0).sum() > 0)
     if has_volume:
