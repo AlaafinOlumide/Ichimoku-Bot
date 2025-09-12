@@ -1,346 +1,286 @@
-import os
-import time
-from datetime import datetime
-from typing import Dict
-
+import os, time, requests
 import pandas as pd
 import numpy as np
+from datetime import datetime, timezone
+from dotenv import load_dotenv
 
-from config import (
-    TD_API_KEY, TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN,
-    SYMBOLS, POLL_SECONDS, ATR_PERIOD, RSI_PERIOD, STO_K, STO_D, SIGNAL_EXPIRATION_BARS,
-    SUMMARY_ENABLED, SUMMARY_UTC_HOUR, SUMMARY_MIN_SIGNALS, LOG_PATH, NEWS_WINDOW_MINS
-)
-from data import fetch_series
-from strategy import MTFStrategy
-from telegram_client import send_message
-from utils import now_utc_iso, append_csv_row, read_csv_df, load_json, save_json
-from sr import daily_pivots_from_h1, swing_points, nearest_levels
-from news import relevant_red_news
+# ========== Config ==========
+load_dotenv()
+TD_API_KEY = os.getenv("TD_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS","XAU/USD,USD/JPY").split(",") if s.strip()]
+POLL_SECONDS = int(os.getenv("POLL_SECONDS","60"))
+ATR_PERIOD = int(os.getenv("ATR_PERIOD","14"))
+RSI_PERIOD = int(os.getenv("RSI_PERIOD","14"))
+STO_K = int(os.getenv("STO_K","14"))
+STO_D = int(os.getenv("STO_D","3"))
+SIGNAL_EXPIRATION_BARS = int(os.getenv("SIGNAL_EXPIRATION_BARS","3"))
 
-SR_HEADROOM = {
-    'xau/usd': 0.80,
-    'usd/jpy': 0.60,
-    'default': 0.70,
+# Per-symbol thresholds (simple defaults)
+THRESH = {
+    "xau/usd": {"atr_min_frac": 0.0012, "rvol_min": 1.20, "bb_overext": 0.25},
+    "usd/jpy": {"atr_min_frac": 0.0006, "rvol_min": 1.05, "bb_overext": 0.20},
+    "default": {"atr_min_frac": 0.0008, "rvol_min": 1.10, "bb_overext": 0.20},
 }
 
-SESSION_BLOCKS = [
-    (0, 6, 'Asia'),
-    (7, 12, 'London'),
-    (13, 20, 'New York'),
-    (21, 23, 'After-hours')
-]
+def now_utc_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-OPEN_POS_PATH = "open_positions.json"
+# ========== Data ==========
+BASE_URL = "https://api.twelvedata.com/time_series"
 
-def session_name(dt_utc):
-    h = dt_utc.hour
-    for start, end, name in SESSION_BLOCKS:
-        if start <= h <= end:
-            return name
-    return 'Unknown'
-
-def atr_based_levels(symbol: str, direction: str, price: float, atr_val: float):
-    s = symbol.lower()
-    if 'xau/usd' in s:
-        sl_mult, tp_mult = 1.0, 1.6
-    elif 'usd/jpy' in s:
-        sl_mult, tp_mult = 0.8, 1.4
-    else:
-        sl_mult, tp_mult = 1.0, 1.5
-    sl_dist = sl_mult * atr_val
-    tp_dist = tp_mult * atr_val
-    if direction == 'BUY':
-        sl = price - sl_dist
-        tp = price + tp_dist
-    else:
-        sl = price + sl_dist
-        tp = price - tp_dist
-    return sl, tp, sl_dist, tp_dist
-
-def _log_signal(symbol, direction, meta, price_close, session, confidence, sl, tp):
-    row = {
-        "time_utc": now_utc_iso(),
+def fetch_series(symbol: str, interval: str, outputsize: int = 300):
+    """
+    Fetches OHLCV (if available) from Twelve Data.
+    Some FX/metal feeds don't include 'volume' — we create a NaN column so downstream code won't KeyError.
+    """
+    params = {
         "symbol": symbol,
-        "direction": direction,
-        "close": round(float(price_close), 6),
-        "confidence": round(float(confidence), 2),
-        "atr_pct": round(float(meta.get("atr_pct", float('nan'))), 6) if meta.get("atr_pct") is not None else None,
-        "rsi": round(float(meta.get("rsi", float('nan'))), 3) if meta.get("rsi") is not None else None,
-        "rvol": round(float(meta.get("rvol", float('nan'))), 3) if meta.get("rvol") is not None else None,
-        "stoch_k": round(float(meta.get("stoch_k", float('nan'))), 3) if meta.get("stoch_k") is not None else None,
-        "stoch_d": round(float(meta.get("stoch_d", float('nan'))), 3) if meta.get("stoch_d") is not None else None,
-        "session": session,
-        "sl": round(float(sl), 6),
-        "tp": round(float(tp), 6),
-        "result": "",  # PENDING/WIN/LOSS
-        "exit_time": "",
-        "rr": "",
+        "interval": interval,
+        "apikey": TD_API_KEY,
+        "outputsize": outputsize,
+        "format": "JSON",
+        "order": "ASC",
     }
-    append_csv_row(LOG_PATH, row, field_order=list(row.keys()))
-
-def _check_tp_sl_hits(open_positions: dict, df_m5: pd.DataFrame, symbol: str):
-    # Check the latest bar's high/low for TP/SL hits
-    if symbol not in open_positions:
-        return
-    if not open_positions[symbol]:
-        return
-    latest = df_m5.iloc[-1]
-    high = float(latest["high"])
-    low = float(latest["low"])
-    closed = []
-    for pos in list(open_positions[symbol]):
-        direction = pos["direction"]
-        entry = float(pos["entry"])
-        tp = float(pos["tp"])
-        sl = float(pos["sl"])
-        # For BUY: TP if high >= tp; SL if low <= sl
-        hit = None
-        if direction == "BUY":
-            if high >= tp:
-                hit = ("WIN", tp)
-            elif low <= sl:
-                hit = ("LOSS", sl)
+    r = requests.get(BASE_URL, params=params, timeout=20)
+    j = r.json()
+    if "values" not in j:
+        return None
+    df = pd.DataFrame(j["values"])
+    # Parse numeric columns that always exist
+    for c in ["open", "high", "low", "close"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
         else:
-            if low <= tp:
-                hit = ("WIN", tp)
-            elif high >= sl:
-                hit = ("LOSS", sl)
-        if hit:
-            outcome, exit_price = hit
-            pos["result"] = outcome
-            pos["exit_time"] = now_utc_iso()
-            rr = abs(exit_price - entry) / max(1e-9, abs(entry - sl))
-            pos["rr"] = rr
-            closed.append(pos)
-            open_positions[symbol].remove(pos)
-    return closed
+            # If any OHLC is missing, fail gracefully
+            return None
 
-def _maybe_send_daily_summary():
-    if not SUMMARY_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    import datetime as _dt
-    now = _dt.datetime.utcnow()
-    if now.hour < SUMMARY_UTC_HOUR:
-        return
-    df = read_csv_df(LOG_PATH)
-    if df.empty:
-        return
-    df["time_utc"] = pd.to_datetime(df["time_utc"], errors="coerce")
-    df = df.dropna(subset=["time_utc"])
-    today_df = df.loc[df["time_utc"].dt.date == now.date()]
-    if today_df.empty or len(today_df) < SUMMARY_MIN_SIGNALS:
-        return
-    if (today_df["direction"] == "SUMMARY").any():
-        return
-    # Performance: match rows with result in same CSV (after pos closes we append a row with outcome)
-    perf = today_df.dropna(subset=["result"])
-    wins = int((perf["result"] == "WIN").sum())
-    losses = int((perf["result"] == "LOSS").sum())
-    total = len(today_df[today_df["direction"].isin(["BUY","SELL"])])
-    avg_conf = float(today_df["confidence"].mean()) if "confidence" in today_df else float("nan")
-    avg_rr = float(perf["rr"].astype(float).replace([np.inf, -np.inf], np.nan).dropna().mean()) if "rr" in perf else float("nan")
-    by_symbol = today_df.groupby("symbol").size().sort_values(ascending=False)
-    by_dir = today_df.groupby("direction").size()
-    top_syms = ", ".join([f"{k}({v})" for k, v in by_symbol.head(5).items()])
-    buys = int(by_dir.get("BUY", 0)); sells = int(by_dir.get("SELL", 0))
-    winrate = (wins / max(1, wins + losses)) * 100.0
-    msg_lines = []
-    msg_lines.append("<b>Daily Signal Summary</b> 📊")
-    msg_lines.append(f"Date (UTC): {now.date().isoformat()}  |  From: {SUMMARY_UTC_HOUR}:00 → 23:59")
-    msg_lines.append(f"Total signals: {total}")
-    msg_lines.append(f"Average confidence: {avg_conf:.1f}%")
-    msg_lines.append(f"BUY/SELL: {buys}/{sells}")
-    msg_lines.append(f"Performance (ATR TP/SL): Wins {wins} | Losses {losses} | Win-rate {winrate:.0f}%")
-    if not np.isnan(avg_rr):
-        msg_lines.append(f"Avg R:R ~ {avg_rr:.2f}")
-    if len(by_symbol) > 0:
-        msg_lines.append(f"Top symbols: {top_syms}")
-    send_message("\n".join(msg_lines))
-    append_csv_row(LOG_PATH, {
-        "time_utc": now_utc_iso(),
-        "symbol": "SUMMARY",
-        "direction": "SUMMARY",
-        "close": "",
-        "confidence": "",
-        "atr_pct": "",
-        "rsi": "",
-        "rvol": "",
-        "stoch_k": "",
-        "stoch_d": "",
-        "session": "",
-        "sl": "",
-        "tp": "",
-        "result": "",
-        "exit_time": "",
-        "rr": "",
-    })
+    # Handle volume optionality
+    if "volume" not in df.columns:
+        df["volume"] = np.nan
+    else:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
-def assemble_message(symbol: str, direction: str, meta: Dict, tf_refs: Dict, confidence: float, atr_val: float, sr_info: Dict | None = None, news_flags=None):
-    h1, m15, m5 = tf_refs["H1"].iloc[-1], tf_refs["M15"].iloc[-1], tf_refs["M5"].iloc[-1]
-    sess = session_name(tf_refs["M5"]["datetime"].iloc[-1].to_pydatetime())
-    sl, tp, sl_dist, tp_dist = atr_based_levels(symbol, direction, float(m5['close']), float(atr_val))
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    return df
+
+# ========== Indicators ==========
+def ema(s, n): 
+    return s.ewm(span=n, adjust=False).mean()
+
+def ema_slope(close, n, lookback):
+    e = ema(close, n)
+    return e, e.diff(lookback)
+
+def rsi(close, n=14):
+    d = close.diff()
+    up = d.clip(lower=0).rolling(n).mean()
+    dn = (-d.clip(upper=0)).rolling(n).mean()
+    rs = up / dn.replace(0, np.nan)
+    out = 100 - 100/(1+rs)
+    return out.fillna(method="bfill").fillna(50)
+
+def stochastic(high, low, close, k=14, d=3):
+    ll = low.rolling(k).min()
+    hh = high.rolling(k).max()
+    K = 100 * (close - ll) / (hh - ll)
+    D = K.rolling(d).mean()
+    return K.fillna(method="bfill"), D.fillna(method="bfill")
+
+def atr(high, low, close, n=14):
+    hl = (high-low).abs()
+    hc = (high-close.shift(1)).abs()
+    lc = (low-close.shift(1)).abs()
+    tr = pd.concat([hl,hc,lc], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def rvol(volume, n=20):
+    avg = volume.rolling(n).mean()
+    return volume / avg.replace(0, np.nan)
+
+def bollinger(close, n=20, mult=2.0):
+    ma = close.rolling(n).mean()
+    std = close.rolling(n).std()
+    return ma, ma+mult*std, ma-mult*std
+
+def bullish_engulfing(df):
+    o, c = df["open"], df["close"]
+    po, pc = o.shift(1), c.shift(1)
+    return ((pc < po) & (c > o) & (c >= po) & (o <= pc)).fillna(False)
+
+def bearish_engulfing(df):
+    o, c = df["open"], df["close"]
+    po, pc = o.shift(1), c.shift(1)
+    return ((pc > po) & (c < o) & (c <= po) & (o >= pc)).fillna(False)
+
+def pin_bar(df, bullish=True, body_ratio=0.3):
+    o, h, l, c = df["open"], df["high"], df["low"], df["close"]
+    body = (c - o).abs()
+    rng = h - l
+    up_w = h - pd.concat([o, c], axis=1).max(axis=1)
+    dn_w = pd.concat([o, c], axis=1).min(axis=1) - l
+    small = body <= (rng * body_ratio)
+    return (small & (dn_w > up_w * 2) & (c > o)) if bullish else (small & (up_w > dn_w * 2) & (c < o))
+
+# ========== Strategy (Lite) ==========
+def trend_bias(df_h1, df_m15):
+    ema_h1, slope_h1 = ema_slope(df_h1["close"], 200, 3)
+    ema_m15, slope_m15 = ema_slope(df_m15["close"], 100, 3)
+    up_h1 = (df_h1["close"] > ema_h1) & (slope_h1 > 0)
+    dn_h1 = (df_h1["close"] < ema_h1) & (slope_h1 < 0)
+    up_m15 = (df_m15["close"] > ema_m15) & (slope_m15 > 0)
+    dn_m15 = (df_m15["close"] < ema_m15) & (slope_m15 < 0)
+    return (
+        bool(up_h1.iloc[-1] and not dn_h1.iloc[-1]),
+        bool(up_m15.iloc[-1] and not dn_m15.iloc[-1]),
+        bool(dn_h1.iloc[-1] and not up_h1.iloc[-1]),
+        bool(dn_m15.iloc[-1] and not up_m15.iloc[-1]),
+    )
+
+def signal_m5(df_m5, symbol):
+    th = THRESH.get(symbol.lower(), THRESH["default"])
+
+    a = atr(df_m5["high"], df_m5["low"], df_m5["close"], ATR_PERIOD)
+    atr_pct = a / df_m5["close"]
+    r = rsi(df_m5["close"], RSI_PERIOD)
+    K, D = stochastic(df_m5["high"], df_m5["low"], df_m5["close"], STO_K, STO_D)
+    ma, bb_u, bb_l = bollinger(df_m5["close"], 20, 2.0)
+
+    # --- RVOL becomes optional ---
+    rv = rvol(df_m5["volume"], 20)
+    has_volume = not df_m5["volume"].isna().all() and (df_m5["volume"].fillna(0).sum() > 0)
+    if has_volume:
+        vol_ok = (rv >= th["rvol_min"]).fillna(False)
+    else:
+        # When no volume present, skip the RVOL filter (treat as passed)
+        rv = pd.Series([1.0] * len(df_m5), index=df_m5.index)
+        vol_ok = pd.Series([True] * len(df_m5), index=df_m5.index)
+
+    # Candlestick confirmations
+    bull_c = (bullish_engulfing(df_m5) | pin_bar(df_m5, bullish=True)).fillna(False)
+    bear_c = (bearish_engulfing(df_m5) | pin_bar(df_m5, bullish=False)).fillna(False)
+
+    # Oscillator confirmations
+    bull_osc = (r < 55) & (K.shift(1) < D.shift(1)) & (K > D) & (r.diff() > 0)
+    bear_osc = (r > 45) & (K.shift(1) > D.shift(1)) & (K < D) & (r.diff() < 0)
+
+    atr_ok = (atr_pct > th["atr_min_frac"]).fillna(False)
+
+    # Bollinger "no overextension"
+    close = df_m5["close"]
+    over = th["bb_overext"] * a
+    buy_bb = (close > ma) & (close <= (bb_u + over))
+    sell_bb = (close < ma) & (close >= (bb_l - over))
+
+    # Fresh-entry window (accept trigger if it occurred within last N bars)
+    recent_buy_zone = (
+        (close <= ma) | (close <= ma + (bb_u - ma) * 0.25) | (close <= ma + a * 0.2)
+    ).rolling(SIGNAL_EXPIRATION_BARS).apply(lambda x: (x > 0).any(), raw=True).astype(bool)
+
+    recent_sell_zone = (
+        (close >= ma) | (close >= ma - (ma - bb_l) * 0.25) | (close >= ma - a * 0.2)
+    ).rolling(SIGNAL_EXPIRATION_BARS).apply(lambda x: (x > 0).any(), raw=True).astype(bool)
+
+    bull_trigger = (bull_osc & bull_c).fillna(False)
+    bear_trigger = (bear_osc & bear_c).fillna(False)
+    fresh_bull = bool(bull_trigger.tail(SIGNAL_EXPIRATION_BARS).any())
+    fresh_bear = bool(bear_trigger.tail(SIGNAL_EXPIRATION_BARS).any())
+
+    i = -1
+    long_ok = bool(atr_ok.iloc[i] and vol_ok.iloc[i] and buy_bb.iloc[i] and recent_buy_zone.iloc[i] and fresh_bull)
+    short_ok = bool(atr_ok.iloc[i] and vol_ok.iloc[i] and sell_bb.iloc[i] and recent_sell_zone.iloc[i] and fresh_bear)
+
+    meta = {
+        "atr_pct": float(atr_pct.iloc[i]) if len(atr_pct) else None,
+        "rsi": float(r.iloc[i]) if len(r) else None,
+        "stoch_k": float(K.iloc[i]) if len(K) else None,
+        "stoch_d": float(D.iloc[i]) if len(D) else None,
+        "rvol": float(rv.iloc[i]) if len(rv) else None,
+        "bull_candle": bool(bull_c.iloc[i]) if len(bull_c) else False,
+        "bear_candle": bool(bear_c.iloc[i]) if len(bear_c) else False,
+        "bb_middle": float(ma.iloc[i]) if len(ma) else None,
+        "bb_upper": float(bb_u.iloc[i]) if len(bb_u) else None,
+        "bb_lower": float(bb_l.iloc[i]) if len(bb_l) else None,
+        "fresh_window_bars": int(SIGNAL_EXPIRATION_BARS),
+        "has_volume": bool(has_volume),
+    }
+    return long_ok, short_ok, meta
+
+# ========== Telegram ==========
+def send_message(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[WARN] Telegram not configured"); print(text); return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML", "disable_web_page_preview": True}
+    try:
+        requests.post(url, json=payload, timeout=15)
+    except Exception as e:
+        print(f"[Telegram] {e}")
+
+def assemble_message(symbol, direction, meta, df_h1, df_m15, df_m5):
+    m5 = df_m5.iloc[-1]; h1 = df_h1.iloc[-1]; m15 = df_m15.iloc[-1]
     txt = []
     txt.append(f"<b>{symbol}</b> — <b>{direction}</b> signal 🚨")
     txt.append(f"Time: {now_utc_iso()}")
     txt.append("")
-    txt.append(f"<b>Session</b>: {sess}")
-    txt.append(f"<b>Confidence</b>: {confidence:.0f}%")
-    txt.append("")
     txt.append("<b>Filters</b>")
     txt.append(f"• ATR%: {meta['atr_pct']:.4f}")
     txt.append(f"• RSI: {meta['rsi']:.1f}  |  Stoch K/D: {meta['stoch_k']:.1f}/{meta['stoch_d']:.1f}")
-    txt.append(f"• RVOL: {meta['rvol']:.2f}")
+    if meta["has_volume"]:
+        txt.append(f"• RVOL: {meta['rvol']:.2f}")
+    else:
+        txt.append("• RVOL: n/a (no volume in feed)")
     txt.append(f"• Candle: {'Bullish' if meta['bull_candle'] else ('Bearish' if meta['bear_candle'] else 'None')}")
     txt.append(f"• BB: mid {meta['bb_middle']:.3f} | up {meta['bb_upper']:.3f} | lo {meta['bb_lower']:.3f}")
     txt.append(f"• Fresh-window: {meta['fresh_window_bars']} bars")
     txt.append("")
     txt.append("<b>Last M5 Bar</b>")
-    txt.append(f"O:{m5['open']:.3f} H:{m5['high']:.3f} L:{m5['low']:.3f} C:{m5['close']:.3f} Vol:{m5['volume']:.0f}")
-    txt.append("")
-    txt.append("<b>TP/SL (ATR-based)</b>")
-    txt.append(f"• SL: {sl:.3f} (dist ~ {sl_dist:.3f})  |  TP: {tp:.3f} (dist ~ {tp_dist:.3f})")
-    if sr_info:
-        txt.append("")
-        txt.append("<b>Nearest S/R</b>")
-        if sr_info.get('nearest_res'):
-            name, lvl, dist = sr_info['nearest_res']
-            txt.append(f"• Resistance: {name} @ {lvl:.3f}  (Δ ~ {dist:.3f})")
-        if sr_info.get('nearest_sup'):
-            name, lvl, dist = sr_info['nearest_sup']
-            txt.append(f"• Support: {name} @ {lvl:.3f}  (Δ ~ {dist:.3f})")
-        if sr_info.get('pivot_day'):
-            txt.append(f"• Pivots from: {sr_info['pivot_day']}")
-    if news_flags:
-        for nf in news_flags:
-            mins = nf.get('mins_from_now')
-            txt.append("")
-            txt.append(f"⚠️ High-impact news: {nf.get('title')} ({nf.get('currency')}) in {mins:+d}m")
+    txt.append(f"O:{m5['open']:.3f} H:{m5['high']:.3f} L:{m5['low']:.3f} C:{m5['close']:.3f} Vol:{0 if pd.isna(m5['volume']) else int(m5['volume'])}")
     txt.append("")
     txt.append("<b>Context</b>")
     txt.append(f"H1 Close: {h1['close']:.3f} | M15 Close: {m15['close']:.3f}")
     txt.append("— Trend: H1 & M15 aligned with signal direction")
-    return "\n".join(txt), sl, tp
+    return "\n".join(txt)
 
+# ========== Main Loop ==========
 def main():
     if not TD_API_KEY:
-        print("[ERROR] TD_API_KEY missing.")
-        return
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] Telegram not configured; signals will print to console.")
-
-    strat = MTFStrategy(rsi_period=RSI_PERIOD, sto_k=STO_K, sto_d=STO_D, atr_period=ATR_PERIOD, expiration_bars=SIGNAL_EXPIRATION_BARS)
-    print(f"[INFO] Starting PP MTF Signal Bot. Symbols={SYMBOLS} Poll={POLL_SECONDS}s")
-
-    last_bar_time: Dict[str, str] = {}
-    open_positions = load_json(OPEN_POS_PATH, default={})
+        print("[ERROR] TD_API_KEY missing"); return
+    last_bar = {}
 
     while True:
         try:
             for symbol in SYMBOLS:
-                df_m5 = fetch_series(symbol, "5min", TD_API_KEY, 300)
-                df_m15 = fetch_series(symbol, "15min", TD_API_KEY, 300)
-                df_h1 = fetch_series(symbol, "1h", TD_API_KEY, 300)
-
-                if df_m5 is None or df_m15 is None or df_h1 is None:
-                    print(f"[WARN] Data fetch failed for {symbol}")
-                    continue
-
-                # Check TP/SL hits for open positions on this symbol
-                closed = _check_tp_sl_hits(open_positions, df_m5, symbol)
-                if closed:
-                    for pos in closed:
-                        # Append a result row to CSV
-                        append_csv_row(LOG_PATH, {
-                            "time_utc": pos["exit_time"],
-                            "symbol": symbol,
-                            "direction": pos["result"],
-                            "close": pos["entry"],
-                            "confidence": "",
-                            "atr_pct": "",
-                            "rsi": "",
-                            "rvol": "",
-                            "stoch_k": "",
-                            "stoch_d": "",
-                            "session": pos.get("session",""),
-                            "sl": pos["sl"],
-                            "tp": pos["tp"],
-                            "result": pos["result"],
-                            "exit_time": pos["exit_time"],
-                            "rr": pos["rr"],
-                        })
-
-                # Only act when a M5 bar closes
-                last_dt = df_m5["datetime"].iloc[-1].isoformat()
-                if last_bar_time.get(symbol) == last_dt:
-                    continue
-                last_bar_time[symbol] = last_dt
-
-                bias_h1_up, bias_m15_up, bias_h1_dn, bias_m15_dn = strat.trend_bias(df_h1, df_m15)
-
-                long_ok, short_ok, meta = strat.signal_m5(df_m5, symbol=symbol)
-
-                # ATR absolute value
                 try:
-                    hl = (df_m5['high'] - df_m5['low']).abs()
-                    hc = (df_m5['high'] - df_m5['close'].shift(1)).abs()
-                    lc = (df_m5['low'] - df_m5['close'].shift(1)).abs()
-                    tr = np.maximum.reduce([hl, hc, lc])
-                    atr_val = float(tr.rolling(14).mean().iloc[-1])
-                except Exception:
-                    atr_val = float('nan')
+                    df_m5 = fetch_series(symbol, "5min", 200)
+                    df_m15 = fetch_series(symbol, "15min", 200)
+                    df_h1 = fetch_series(symbol, "1h", 300)
+                    if df_m5 is None or df_m15 is None or df_h1 is None:
+                        print(f"[WARN] data fetch failed for {symbol}")
+                        continue
 
-                fire_long = long_ok and bias_h1_up and bias_m15_up
-                fire_short = short_ok and bias_h1_dn and bias_m15_dn
+                    last_dt = df_m5["datetime"].iloc[-1].isoformat()
+                    if last_bar.get(symbol) == last_dt:
+                        continue
+                    last_bar[symbol] = last_dt
 
-                # S/R filtering
-                piv = daily_pivots_from_h1(df_h1)
-                sh, sl_sw = swing_points(df_m15, lookback=60, left=2, right=2)
-                price = float(df_m5['close'].iloc[-1])
-                nearest_res, nearest_sup = nearest_levels(price, piv, sh, sl_sw)
-                sym_key = symbol.lower()
-                head_mult = SR_HEADROOM.get(sym_key, SR_HEADROOM['default'])
-                ok_headroom_long = True
-                ok_headroom_short = True
-                if nearest_res is not None and not (nearest_res[2] >= head_mult * (atr_val if atr_val == atr_val else 0.0)):
-                    ok_headroom_long = False
-                if nearest_sup is not None and not (nearest_sup[2] >= head_mult * (atr_val if atr_val == atr_val else 0.0)):
-                    ok_headroom_short = False
-                fire_long = fire_long and ok_headroom_long
-                fire_short = fire_short and ok_headroom_short
+                    up_h1, up_m15, dn_h1, dn_m15 = trend_bias(df_h1, df_m15)
+                    long_ok, short_ok, meta = signal_m5(df_m5, symbol)
 
-                if fire_long or fire_short:
-                    direction = "BUY" if fire_long else "SELL"
-                    conf = float(meta.get('confidence', 50.0))
-                    sr_info = {'nearest_res': nearest_res, 'nearest_sup': nearest_sup, 'pivot_day': piv.get('src_day') if piv else None}
-                    news_flags = relevant_red_news(symbol, NEWS_WINDOW_MINS)
-                    msg, sl_val, tp_val = assemble_message(symbol, direction, meta, {"H1": df_h1, "M15": df_m15, "M5": df_m5}, conf, atr_val, sr_info, news_flags)
-                    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                    fire_long = long_ok and up_h1 and up_m15
+                    fire_short = short_ok and dn_h1 and dn_m15
+
+                    if fire_long or fire_short:
+                        direction = "BUY" if fire_long else "SELL"
+                        msg = assemble_message(symbol, direction, meta, df_h1, df_m15, df_m5)
                         send_message(msg)
-                    print(msg)
-                    # Log and store open position for TP/SL tracking
-                    try:
-                        sess = session_name(df_m5["datetime"].iloc[-1].to_pydatetime())
-                        _log_signal(symbol, direction, meta, float(df_m5['close'].iloc[-1]), sess, conf, sl_val, tp_val)
-                        if symbol not in open_positions:
-                            open_positions[symbol] = []
-                        open_positions[symbol].append({
-                            "direction": direction,
-                            "entry": float(df_m5['close'].iloc[-1]),
-                            "sl": float(sl_val),
-                            "tp": float(tp_val),
-                            "session": sess,
-                            "result": "",
-                            "exit_time": "",
-                            "rr": ""
-                        })
-                        save_json(OPEN_POS_PATH, open_positions)
-                    except Exception as _e:
-                        print(f"[WARN] log/store error: {_e}")
-                else:
-                    print(f"[{symbol}] {last_dt} — no aligned signal.")
-
-            _maybe_send_daily_summary()
+                        print(msg)
+                    else:
+                        print(f"[{symbol}] {last_dt} — no aligned signal.")
+                except Exception as e_sym:
+                    print(f"[ERROR] Symbol loop exception for {symbol}: {e_sym}")
             time.sleep(POLL_SECONDS)
         except Exception as e:
             print(f"[ERROR] Loop exception: {e}")
