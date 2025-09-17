@@ -10,6 +10,8 @@ TD_API_KEY = os.getenv("TD_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+DEBUG = os.getenv("DEBUG", "0") == "1"
+
 # Fixed symbols (no slashes; works well on Twelve Data)
 SYMBOLS = ["XAUUSD", "USDJPY"]
 
@@ -144,24 +146,22 @@ def pin_bar(df, bullish=True, body_ratio=0.3):
     small = body <= (rng * body_ratio)
     return (small & (dn_w > up_w * 2) & (c > o)) if bullish else (small & (up_w > dn_w * 2) & (c < o))
 
-# ================== Ichimoku ==================
-def ichimoku(df, tenkan=9, kijun=26, senkou=52, displacement=26):
+# ================== Ichimoku (correctly aligned) ==================
+def ichimoku_core(df, tenkan=9, kijun=26, senkou=52):
+    """
+    Core Ichimoku lines WITHOUT forward displacement (good for decision logic).
+    For plotting, you'd shift Span A/B forward; for logic, compare price to current spans.
+    """
     high = df["high"]; low = df["low"]; close = df["close"]
     tenkan_sen = (high.rolling(tenkan).max() + low.rolling(tenkan).min()) / 2
     kijun_sen  = (high.rolling(kijun).max() + low.rolling(kijun).min()) / 2
-    senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(displacement)
-    senkou_span_b = ((high.rolling(senkou).max() + low.rolling(senkou).min()) / 2).shift(displacement)
-    chikou_span = close.shift(-displacement)
-    return pd.DataFrame({
-        "tenkan": tenkan_sen,
-        "kijun": kijun_sen,
-        "span_a": senkou_span_a,
-        "span_b": senkou_span_b,
-        "chikou": chikou_span
-    })
+    span_a = (tenkan_sen + kijun_sen) / 2                # no shift
+    span_b = (high.rolling(senkou).max() + low.rolling(senkou).min()) / 2  # no shift
+    chikou  = close.shift(-26)  # chikou is still shifted back for confirmation vs price 26 ago
+    return pd.DataFrame({"tenkan": tenkan_sen, "kijun": kijun_sen, "span_a": span_a, "span_b": span_b, "chikou": chikou})
 
 def ichimoku_bias(df):
-    ichi = ichimoku(df)
+    ichi = ichimoku_core(df)
     cloud_top  = pd.concat([ichi["span_a"], ichi["span_b"]], axis=1).max(axis=1)
     cloud_bot  = pd.concat([ichi["span_a"], ichi["span_b"]], axis=1).min(axis=1)
     price = df["close"]
@@ -171,18 +171,24 @@ def ichimoku_bias(df):
             "cloud_top": cloud_top, "cloud_bot": cloud_bot}
 
 def ichimoku_signal_strict(df, fresh_bars=3):
-    """Strict M5 confirmation: TK cross (fresh), price on correct cloud side, Chikou confirm."""
-    ichi = ichimoku(df)
+    """Strict M5 confirmation: fresh TK cross + price beyond cloud + Chikou confirm."""
+    ichi = ichimoku_core(df)
     price = df["close"]
     cloud_top = pd.concat([ichi["span_a"], ichi["span_b"]], axis=1).max(axis=1)
     cloud_bot = pd.concat([ichi["span_a"], ichi["span_b"]], axis=1).min(axis=1)
+
     tk_up   = (ichi["tenkan"].shift(1) <= ichi["kijun"].shift(1)) & (ichi["tenkan"] > ichi["kijun"])
     tk_down = (ichi["tenkan"].shift(1) >= ichi["kijun"].shift(1)) & (ichi["tenkan"] < ichi["kijun"])
     recent_bull = bool(tk_up.tail(fresh_bars).any())
     recent_bear = bool(tk_down.tail(fresh_bars).any())
+
     chikou = ichi["chikou"]; price_26_ago = price.shift(26)
-    bull_ok = recent_bull and bool(price.iloc[-1] > cloud_top.iloc[-1]) and bool(chikou.iloc[-1] > price_26_ago.iloc[-1])
-    bear_ok = recent_bear and bool(price.iloc[-1] < cloud_bot.iloc[-1]) and bool(chikou.iloc[-1] < price_26_ago.iloc[-1])
+
+    bull_ok = recent_bull and bool(pd.notna(cloud_top.iloc[-1]) and price.iloc[-1] > cloud_top.iloc[-1]) \
+              and bool(pd.notna(chikou.iloc[-1]) and pd.notna(price_26_ago.iloc[-1]) and chikou.iloc[-1] > price_26_ago.iloc[-1])
+    bear_ok = recent_bear and bool(pd.notna(cloud_bot.iloc[-1]) and price.iloc[-1] < cloud_bot.iloc[-1]) \
+              and bool(pd.notna(chikou.iloc[-1]) and pd.notna(price_26_ago.iloc[-1]) and chikou.iloc[-1] < price_26_ago.iloc[-1])
+
     meta = {
         "tenkan": float(ichi["tenkan"].iloc[-1]) if pd.notna(ichi["tenkan"].iloc[-1]) else None,
         "kijun": float(ichi["kijun"].iloc[-1]) if pd.notna(ichi["kijun"].iloc[-1]) else None,
@@ -194,10 +200,11 @@ def ichimoku_signal_strict(df, fresh_bars=3):
 
 def ichimoku_signal_relaxed(df, fresh_bars=6):
     """Relaxed M5: recent TK cross (wider window), price above Kijun OR above cloud (and vice versa), Chikou optional."""
-    ichi = ichimoku(df)
+    ichi = ichimoku_core(df)
     price = df["close"]
     cloud_top = pd.concat([ichi["span_a"], ichi["span_b"]], axis=1).max(axis=1)
     cloud_bot = pd.concat([ichi["span_a"], ichi["span_b"]], axis=1).min(axis=1)
+
     tk_up   = (ichi["tenkan"].shift(1) <= ichi["kijun"].shift(1)) & (ichi["tenkan"] > ichi["kijun"])
     tk_down = (ichi["tenkan"].shift(1) >= ichi["kijun"].shift(1)) & (ichi["tenkan"] < ichi["kijun"])
     recent_bull = bool(tk_up.tail(fresh_bars).any())
@@ -206,8 +213,8 @@ def ichimoku_signal_relaxed(df, fresh_bars=6):
     above_kijun = price > ichi["kijun"]
     below_kijun = price < ichi["kijun"]
 
-    bull_ok = recent_bull and bool((price.iloc[-1] > cloud_top.iloc[-1]) or (above_kijun.iloc[-1]))
-    bear_ok = recent_bear and bool((price.iloc[-1] < cloud_bot.iloc[-1]) or (below_kijun.iloc[-1]))
+    bull_ok = recent_bull and bool(pd.notna(cloud_top.iloc[-1]) and (price.iloc[-1] > cloud_top.iloc[-1] or above_kijun.iloc[-1]))
+    bear_ok = recent_bear and bool(pd.notna(cloud_bot.iloc[-1]) and (price.iloc[-1] < cloud_bot.iloc[-1] or below_kijun.iloc[-1]))
 
     meta = {
         "tenkan": float(ichi["tenkan"].iloc[-1]) if pd.notna(ichi["tenkan"].iloc[-1]) else None,
@@ -240,11 +247,11 @@ def combined_trend_bias(df_h1, df_m15, relaxed: bool):
 
     if relaxed:
         # Relaxed: allow Ichimoku OR EMA on both TFs in same direction
-        up_ok = ( (up_h1_i and up_m15_i) or (up_h1_e and up_m15_e) )
-        down_ok = ( (dn_h1_i and dn_m15_i) or (dn_h1_e and dn_m15_e) )
+        up_ok   = ((up_h1_i and up_m15_i) or (up_h1_e and up_m15_e))
+        down_ok = ((dn_h1_i and dn_m15_i) or (dn_h1_e and dn_m15_e))
     else:
         # Strict: require BOTH Ichimoku AND EMA alignment
-        up_ok = (up_h1_i and up_m15_i) and (up_h1_e and up_m15_e)
+        up_ok   = (up_h1_i and up_m15_i) and (up_h1_e and up_m15_e)
         down_ok = (dn_h1_i and dn_m15_i) and (dn_h1_e and dn_m15_e)
 
     return up_ok, down_ok, h1_ichi, m15_ichi
@@ -296,6 +303,11 @@ def signal_m5(df_m5, symbol, relaxed: bool):
     i = -1
     long_ok = bool(atr_ok.iloc[i] and vol_ok.iloc[i] and buy_bb.iloc[i] and fresh_bull and ichi_long)
     short_ok = bool(atr_ok.iloc[i] and vol_ok.iloc[i] and sell_bb.iloc[i] and fresh_bear and ichi_short)
+
+    if DEBUG:
+        print(f"[DBG] M5 gates {symbol} relaxed={relaxed} | atr_ok={bool(atr_ok.iloc[i])} vol_ok={bool(vol_ok.iloc[i])} "
+              f"bb_ok={'BUY' if buy_bb.iloc[i] else ('SELL' if sell_bb.iloc[i] else 'NO')} "
+              f"fresh_bull={fresh_bull} fresh_bear={fresh_bear} ichi_long={ichi_long} ichi_short={ichi_short}")
 
     meta = {
         "mode": "RELAXED" if relaxed else "STRICT",
@@ -389,10 +401,7 @@ def main():
         try:
             # Determine mode based on time since last signal
             now_ts = time.time()
-            if last_signal_ts is None:
-                minutes_since = 1e9
-            else:
-                minutes_since = (now_ts - last_signal_ts) / 60.0
+            minutes_since = 1e9 if last_signal_ts is None else (now_ts - last_signal_ts) / 60.0
             relaxed = minutes_since >= RELAX_IF_NO_SIGNAL_MIN
             mode_note = "RELAXED" if relaxed else "STRICT"
 
@@ -410,6 +419,9 @@ def main():
 
                     fire_long  = long_ok  and up_trend
                     fire_short = short_ok and down_trend
+
+                    if DEBUG:
+                        print(f"[DBG] Trend gates {symbol} relaxed={relaxed} | up_trend={up_trend} down_trend={down_trend}")
 
                     if fire_long or fire_short:
                         direction = "BUY" if fire_long else "SELL"
